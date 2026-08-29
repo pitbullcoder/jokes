@@ -2,6 +2,7 @@
 Description=Marion Joke Bot - answer joke requests on the public channel
 After=network-online.target openhop-repeater.service
 Wants=network-online.target
+PartOf=openhop-repeater.service
 
 [Service]
 Type=simple
