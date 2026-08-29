@@ -1,0 +1,15 @@
+[Unit]
+Description=Marion Joke Bot - answer joke requests on the public channel
+After=network-online.target openhop-repeater.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/jokes
+ExecStart=/opt/jokes/venv/bin/python3 /opt/jokes/jokes.py --config /opt/jokes/config.json
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

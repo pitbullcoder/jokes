@@ -1,0 +1,10 @@
+{
+  "host": "127.0.0.1",
+  "port": 5055,
+  "channel_index": 0,
+  "cooldown_secs": 60,
+  "triggers": {
+    "joke dustin": "dustin",
+    "joke cat": "cat"
+  }
+}
