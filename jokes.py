@@ -30,6 +30,10 @@ MAX_MESSAGE_CHARS = 130
 # How long to wait before retrying a dropped companion connection.
 RECONNECT_DELAY_SECS = 15
 
+# Pending replies to hold before dropping. A backlog on a slow LoRa channel is
+# stale by the time it would go out, so a shallow queue is the honest choice.
+OUTBOX_DEPTH = 8
+
 
 def load_config(path):
     """Read and validate the JSON config file."""
@@ -53,6 +57,7 @@ def load_config(path):
     cfg.setdefault("state_path", os.path.join(HERE, "state.json"))
     cfg.setdefault("cooldown_secs", 60)
     cfg.setdefault("ignore_senders", [])
+    cfg.setdefault("send_gap_secs", 2)
 
     # Channel messages go out as "<node name>: <text>", so the node name eats
     # into the 130-char ceiling. Reserve it here rather than discovering it as
@@ -64,6 +69,9 @@ def load_config(path):
 
     if not isinstance(cfg["ignore_senders"], list):
         raise ValueError("config 'ignore_senders' must be a list")
+
+    if not isinstance(cfg["send_gap_secs"], (int, float)) or cfg["send_gap_secs"] < 0:
+        raise ValueError("config 'send_gap_secs' must be a non-negative number")
 
     overhead = cfg["reply_overhead_chars"]
     if not isinstance(overhead, int) or not 0 <= overhead < MAX_MESSAGE_CHARS:
@@ -305,7 +313,7 @@ def make_handler(cfg, book, cooldown, sender):
             return
 
         cooldown.mark(list_name)
-        LOG.info("replying to %s with %s (%d chars): %s",
+        LOG.info("queueing reply to %s from %s (%d chars): %s",
                  who or "unknown", list_name, len(joke), joke)
         await sender(joke)
 
@@ -314,6 +322,12 @@ def make_handler(cfg, book, cooldown, sender):
 
 async def run(cfg, book, cooldown):
     """Connect to the companion and serve requests until interrupted.
+
+    Transmission happens on a worker task fed by a queue, deliberately not in
+    the event callback. Awaiting a command from inside the library's dispatcher
+    means the response that command is waiting for cannot be processed, and the
+    send hangs. The queue also serializes traffic, which a shared LoRa channel
+    wants anyway.
 
     Reconnects on its own, because a service that dies quietly on a dropped
     socket is worse than one that keeps trying.
@@ -331,13 +345,34 @@ async def run(cfg, book, cooldown):
         LOG.info("connected to %s:%s, watching channel %s",
                  cfg["host"], cfg["port"], cfg["channel_index"])
 
-        async def sender(message):
-            await mc.commands.send_chan_msg(cfg["channel_index"], message)
+        outbox = asyncio.Queue(maxsize=OUTBOX_DEPTH)
+
+        async def enqueue(message):
+            try:
+                outbox.put_nowait(message)
+            except asyncio.QueueFull:
+                LOG.warning("outbox full; dropping reply: %s", message)
+
+        async def transmit():
+            while True:
+                message = await outbox.get()
+                try:
+                    result = await mc.commands.send_chan_msg(
+                        cfg["channel_index"], message
+                    )
+                    LOG.info("sent %d chars; companion returned: %r", len(message), result)
+                except Exception as exc:  # noqa: BLE001 - log and keep serving
+                    LOG.error("send failed: %s", exc)
+                finally:
+                    outbox.task_done()
+                await asyncio.sleep(cfg["send_gap_secs"])
+
+        worker = asyncio.create_task(transmit())
 
         try:
             mc.subscribe(
                 EventType.CHANNEL_MSG_RECV,
-                make_handler(cfg, book, cooldown, sender),
+                make_handler(cfg, book, cooldown, enqueue),
                 attribute_filters={"channel_idx": cfg["channel_index"]},
             )
             await mc.start_auto_message_fetching()
@@ -347,10 +382,12 @@ async def run(cfg, book, cooldown):
                 await asyncio.sleep(3600)
                 book.reload_if_changed()
         except asyncio.CancelledError:
+            worker.cancel()
             await mc.disconnect()
             raise
         except Exception as exc:  # noqa: BLE001 - drop the socket and retry
             LOG.error("connection lost: %s", exc)
+            worker.cancel()
             try:
                 await mc.disconnect()
             except Exception:  # noqa: BLE001

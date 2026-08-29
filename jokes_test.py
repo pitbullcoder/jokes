@@ -296,6 +296,15 @@ class LoadConfigTest(TempFileMixin, unittest.TestCase):
         with self.assertRaises(ValueError):
             jokes.load_config(self._write_json(payload))
 
+    def test_send_gap_defaults(self):
+        cfg = jokes.load_config(self._write_json(dict(self.BASE)))
+        self.assertEqual(cfg["send_gap_secs"], 2)
+
+    def test_negative_send_gap_is_rejected(self):
+        payload = dict(self.BASE, send_gap_secs=-1)
+        with self.assertRaises(ValueError):
+            jokes.load_config(self._write_json(payload))
+
     def test_non_list_ignore_senders_is_rejected(self):
         payload = dict(self.BASE, ignore_senders="Marion Jokes Bot")
         with self.assertRaises(ValueError):

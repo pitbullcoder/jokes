@@ -31,6 +31,10 @@ companion socket drops.
   so a restart or reboot resumes where it left off instead of starting over.
 - A per-list cooldown (default 60s) keeps someone hammering `joke cat` from
   wallpapering the channel. LoRa is shared and slow.
+- Replies are queued and transmitted on a worker task, never inside the event
+  callback. Awaiting a send from inside the library's dispatcher means the
+  response that send is waiting on cannot be processed, and it hangs. The queue
+  also serializes traffic and spaces it by `send_gap_secs`.
 - Every reply is trimmed to MeshCore's 130-character limit at a word boundary.
 
 ## Install
@@ -49,6 +53,9 @@ write there:
 ```bash
 sudo chown -R pi:pi /opt/jokes
 ```
+
+Skipping this does not stop the bot — it logs a warning and keeps answering —
+but the rotation position resets to the top of each list on every restart.
 
 Check the replies before putting it on the air:
 
@@ -80,6 +87,7 @@ dustin`. Then send `joke cat` from a client on the public channel.
 | `host` / `port` | Companion TCP endpoint — this bot needs its **own** companion |
 | `channel_index` | Channel to listen and reply on. `0` is public. |
 | `cooldown_secs` | Minimum seconds between replies per list. `0` disables. |
+| `send_gap_secs` | Pause between consecutive transmissions. Default 2. |
 | `reply_overhead_chars` | Characters reserved for the `Node Name: ` prefix on replies |
 | `ignore_senders` | Sender names to ignore — put the bot's own node name here |
 | `triggers` | Map of trigger phrase to joke list name |
