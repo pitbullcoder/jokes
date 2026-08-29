@@ -14,10 +14,19 @@ companion socket drops.
 
 ## Behavior
 
-- Triggers match the **whole** message, case-insensitively, ignoring extra
-  spaces and trailing punctuation. `Joke Cat!` works; `hey try joke cat` does
-  not. Whole-message matching is deliberate — the bot replies on the same
-  channel it listens to, so substring matching would let a reply retrigger it.
+- Channel messages arrive with the sender's name folded into the text — a
+  request from KF8DDU shows up as `KF8DDU: joke cat`. The bot strips that
+  prefix before matching.
+- Triggers match the **whole** message once the prefix is off, case
+  insensitively, ignoring extra spaces and trailing punctuation. `Joke Cat!`
+  works; `hey try joke cat` does not. Whole-message matching is deliberate —
+  the bot replies on the same channel it listens to, so substring matching
+  would let a reply retrigger it.
+- `ignore_senders` drops anything the bot hears from itself, as a second layer
+  of loop protection behind whole-message matching.
+- The same prefixing applies to replies, so the node name eats into the
+  130-character budget. `reply_overhead_chars` reserves it: at 18 (the length
+  of `Marion Jokes Bot: `) the longest shipped joke lands at 104 on the air.
 - Each list has its own position, persisted to `state.json` after every reply,
   so a restart or reboot resumes where it left off instead of starting over.
 - A per-list cooldown (default 60s) keeps someone hammering `joke cat` from
@@ -71,6 +80,8 @@ dustin`. Then send `joke cat` from a client on the public channel.
 | `host` / `port` | Companion TCP endpoint — this bot needs its **own** companion |
 | `channel_index` | Channel to listen and reply on. `0` is public. |
 | `cooldown_secs` | Minimum seconds between replies per list. `0` disables. |
+| `reply_overhead_chars` | Characters reserved for the `Node Name: ` prefix on replies |
+| `ignore_senders` | Sender names to ignore — put the bot's own node name here |
 | `triggers` | Map of trigger phrase to joke list name |
 | `jokes_path` | Optional. Defaults to `jokes.json` beside the script. |
 | `state_path` | Optional. Defaults to `state.json` beside the script. |
@@ -91,6 +102,25 @@ python3 -m pyflakes jokes.py jokes_test.py
 The suite covers the matcher, the rotation, the cooldown and the reply loop,
 and also checks the shipped `jokes.json`: at least 30 jokes per list, none over
 130 characters, no duplicates, and no joke that would trigger the bot itself.
+
+## Troubleshooting
+
+If the bot connects and logs `listening for: ...` but never answers, run it with
+`-v` — debug logging prints every channel message it hears, matched or not:
+
+```bash
+sudo systemctl stop jokes.service
+/opt/jokes/venv/bin/python3 /opt/jokes/jokes.py -v
+```
+
+`probe.py` goes one level lower and dumps the raw payload of every event the
+companion delivers, with no filtering at all. Use it when you need to know
+whether messages are arriving but being rejected, or not arriving in the first
+place:
+
+```bash
+/opt/jokes/venv/bin/python3 /opt/jokes/probe.py
+```
 
 ## Notes
 

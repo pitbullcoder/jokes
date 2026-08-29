@@ -3,6 +3,8 @@
   "port": 5055,
   "channel_index": 0,
   "cooldown_secs": 60,
+  "reply_overhead_chars": 18,
+  "ignore_senders": ["Marion Jokes Bot"],
   "triggers": {
     "joke dustin": "dustin",
     "joke cat": "cat"

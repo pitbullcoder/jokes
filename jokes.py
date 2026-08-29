@@ -52,9 +52,24 @@ def load_config(path):
     cfg.setdefault("jokes_path", os.path.join(HERE, "jokes.json"))
     cfg.setdefault("state_path", os.path.join(HERE, "state.json"))
     cfg.setdefault("cooldown_secs", 60)
+    cfg.setdefault("ignore_senders", [])
+
+    # Channel messages go out as "<node name>: <text>", so the node name eats
+    # into the 130-char ceiling. Reserve it here rather than discovering it as
+    # a truncated punchline on the air.
+    cfg.setdefault("reply_overhead_chars", 0)
 
     if not isinstance(cfg["cooldown_secs"], (int, float)) or cfg["cooldown_secs"] < 0:
         raise ValueError("config 'cooldown_secs' must be a non-negative number")
+
+    if not isinstance(cfg["ignore_senders"], list):
+        raise ValueError("config 'ignore_senders' must be a list")
+
+    overhead = cfg["reply_overhead_chars"]
+    if not isinstance(overhead, int) or not 0 <= overhead < MAX_MESSAGE_CHARS:
+        raise ValueError(
+            "config 'reply_overhead_chars' must be an int in 0..%d" % (MAX_MESSAGE_CHARS - 1)
+        )
 
     return cfg
 
@@ -90,20 +105,39 @@ def normalize(text):
     return " ".join(word for word in cleaned if word)
 
 
+def split_sender(text):
+    """Split "SENDER: message" into its two halves.
+
+    Channel messages arrive with the sender's name prepended into the text --
+    a request from KF8DDU shows up as "KF8DDU: joke cat". Returns
+    (sender, body); sender is "" when there is no prefix to strip.
+    """
+    if not text:
+        return "", ""
+
+    sender, sep, body = text.partition(": ")
+    if sep and sender.strip() and "\n" not in sender:
+        return sender.strip(), body.strip()
+
+    return "", text.strip()
+
+
 def match_trigger(text, triggers):
     """Return the joke list name for an incoming message, or None.
 
-    Matching is exact against the whole normalized message. Substring matching
-    would fire on someone merely talking about the bot, and on a shared channel
-    that turns into a feedback loop nobody enjoys.
+    Matching is exact against the whole message once the sender prefix is off.
+    Substring matching would fire on someone merely talking about the bot, and
+    on a shared channel that turns into a feedback loop nobody enjoys.
     """
-    normalized = normalize(text)
-    if not normalized:
-        return None
+    _, body = split_sender(text)
 
-    for phrase, list_name in triggers.items():
-        if normalize(phrase) == normalized:
-            return list_name
+    for candidate in (body, text):
+        normalized = normalize(candidate)
+        if not normalized:
+            continue
+        for phrase, list_name in triggers.items():
+            if normalize(phrase) == normalized:
+                return list_name
 
     return None
 
@@ -195,14 +229,14 @@ class JokeBook:
     def lists(self):
         return sorted(self._book)
 
-    def peek(self, list_name):
+    def peek(self, list_name, limit=MAX_MESSAGE_CHARS):
         """The joke that would be sent next, without advancing."""
         jokes = self._book.get(list_name)
         if not jokes:
             return None
-        return fit(jokes[self._state.get(list_name, 0) % len(jokes)])
+        return fit(jokes[self._state.get(list_name, 0) % len(jokes)], limit)
 
-    def next_joke(self, list_name):
+    def next_joke(self, list_name, limit=MAX_MESSAGE_CHARS):
         """Take the next joke in sequence and advance the position."""
         jokes = self._book.get(list_name)
         if not jokes:
@@ -213,7 +247,7 @@ class JokeBook:
         joke = jokes[index]
         self._state[list_name] = (index + 1) % len(jokes)
         self._write_state()
-        return fit(joke)
+        return fit(joke, limit)
 
 
 class Cooldown:
@@ -241,26 +275,38 @@ class Cooldown:
 def make_handler(cfg, book, cooldown, sender):
     """Build the CHANNEL_MSG_RECV callback."""
 
+    ignored = {name.strip().lower() for name in cfg.get("ignore_senders", []) if name.strip()}
+    limit = MAX_MESSAGE_CHARS - cfg.get("reply_overhead_chars", 0)
+
     async def on_channel_message(event):
         payload = getattr(event, "payload", None) or {}
         text = payload.get("text", "")
-        who = payload.get("pubkey_prefix", "unknown")
+        who, body = split_sender(text)
+
+        # Logged for everything, matched or not -- a silent bot and a bot that
+        # never hears anything look identical in the journal otherwise.
+        LOG.debug("rx from %r: %r", who or "unknown", body)
+
+        if who and who.lower() in ignored:
+            LOG.debug("ignoring our own traffic from %r", who)
+            return
 
         list_name = match_trigger(text, cfg["triggers"])
         if not list_name:
             return
 
         if not cooldown.ready(list_name):
-            LOG.info("ignoring '%s' from %s; still cooling down", list_name, who)
+            LOG.info("ignoring '%s' from %s; still cooling down", list_name, who or "unknown")
             return
 
         book.reload_if_changed()
-        joke = book.next_joke(list_name)
+        joke = book.next_joke(list_name, limit=limit)
         if not joke:
             return
 
         cooldown.mark(list_name)
-        LOG.info("replying to %s with %s (%d chars): %s", who, list_name, len(joke), joke)
+        LOG.info("replying to %s with %s (%d chars): %s",
+                 who or "unknown", list_name, len(joke), joke)
         await sender(joke)
 
     return on_channel_message
@@ -354,9 +400,11 @@ def main(argv=None):
         LOG.error("no joke lists loaded")
         return 1
 
+    limit = MAX_MESSAGE_CHARS - cfg["reply_overhead_chars"]
+
     if args.list:
         for phrase, list_name in sorted(cfg["triggers"].items()):
-            joke = book.peek(list_name)
+            joke = book.peek(list_name, limit=limit)
             print("%-16s -> %-10s %s" % (phrase, list_name, joke or "(empty list)"))
         return 0
 
@@ -365,8 +413,8 @@ def main(argv=None):
         if not list_name:
             print("no trigger matches %r" % args.dry_run)
             return 1
-        joke = book.next_joke(list_name)
-        print("--- %d of %d chars ---" % (len(joke), MAX_MESSAGE_CHARS))
+        joke = book.next_joke(list_name, limit=limit)
+        print("--- %d of %d chars ---" % (len(joke), limit))
         print(joke)
         return 0
 

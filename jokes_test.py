@@ -73,11 +73,45 @@ class NormalizeTest(unittest.TestCase):
         self.assertEqual(jokes.normalize("!!!"), "")
 
 
+class SplitSenderTest(unittest.TestCase):
+    def test_callsign_prefix_is_split_off(self):
+        self.assertEqual(jokes.split_sender("KF8DDU: joke cat"), ("KF8DDU", "joke cat"))
+
+    def test_multiword_node_name_is_split_off(self):
+        self.assertEqual(
+            jokes.split_sender("Marion Jokes Bot: hello"), ("Marion Jokes Bot", "hello")
+        )
+
+    def test_message_without_a_prefix_is_returned_whole(self):
+        self.assertEqual(jokes.split_sender("joke cat"), ("", "joke cat"))
+
+    def test_only_the_first_separator_splits(self):
+        self.assertEqual(
+            jokes.split_sender("KF8DDU: note: read this"), ("KF8DDU", "note: read this")
+        )
+
+    def test_empty_text_is_survivable(self):
+        self.assertEqual(jokes.split_sender(""), ("", ""))
+
+    def test_none_is_survivable(self):
+        self.assertEqual(jokes.split_sender(None), ("", ""))
+
+
 class MatchTriggerTest(unittest.TestCase):
     TRIGGERS = {"joke dustin": "dustin", "joke cat": "cat"}
 
     def test_exact_phrase_matches(self):
         self.assertEqual(jokes.match_trigger("joke cat", self.TRIGGERS), "cat")
+
+    def test_message_with_a_callsign_prefix_matches(self):
+        # This is the shape that actually arrives over the air.
+        self.assertEqual(jokes.match_trigger("KF8DDU: joke cat", self.TRIGGERS), "cat")
+
+    def test_prefixed_message_is_still_case_insensitive(self):
+        self.assertEqual(jokes.match_trigger("KF8DDU: JOKE DUSTIN", self.TRIGGERS), "dustin")
+
+    def test_prefixed_message_tolerates_punctuation(self):
+        self.assertEqual(jokes.match_trigger("KF8DDU: joke cat!", self.TRIGGERS), "cat")
 
     def test_matching_is_case_insensitive(self):
         self.assertEqual(jokes.match_trigger("JOKE DUSTIN", self.TRIGGERS), "dustin")
@@ -94,6 +128,11 @@ class MatchTriggerTest(unittest.TestCase):
     def test_substring_in_a_sentence_does_not_match(self):
         self.assertIsNone(
             jokes.match_trigger("someone should ask for a joke cat later", self.TRIGGERS)
+        )
+
+    def test_prefixed_substring_does_not_match(self):
+        self.assertIsNone(
+            jokes.match_trigger("KF8DDU: you should try joke cat", self.TRIGGERS)
         )
 
     def test_a_joke_about_the_trigger_does_not_match(self):
@@ -242,6 +281,26 @@ class LoadConfigTest(TempFileMixin, unittest.TestCase):
         with self.assertRaises(ValueError):
             jokes.load_config(self._write_json(payload))
 
+    def test_reply_overhead_defaults_to_zero(self):
+        cfg = jokes.load_config(self._write_json(dict(self.BASE)))
+        self.assertEqual(cfg["reply_overhead_chars"], 0)
+        self.assertEqual(cfg["ignore_senders"], [])
+
+    def test_negative_reply_overhead_is_rejected(self):
+        payload = dict(self.BASE, reply_overhead_chars=-1)
+        with self.assertRaises(ValueError):
+            jokes.load_config(self._write_json(payload))
+
+    def test_reply_overhead_swallowing_the_whole_limit_is_rejected(self):
+        payload = dict(self.BASE, reply_overhead_chars=jokes.MAX_MESSAGE_CHARS)
+        with self.assertRaises(ValueError):
+            jokes.load_config(self._write_json(payload))
+
+    def test_non_list_ignore_senders_is_rejected(self):
+        payload = dict(self.BASE, ignore_senders="Marion Jokes Bot")
+        with self.assertRaises(ValueError):
+            jokes.load_config(self._write_json(payload))
+
 
 class CooldownTest(unittest.TestCase):
     def setUp(self):
@@ -280,6 +339,8 @@ class HandlerTest(TempFileMixin, unittest.TestCase):
         self.cfg = {
             "channel_index": 0,
             "triggers": {"joke dustin": "dustin", "joke cat": "cat"},
+            "ignore_senders": ["Marion Jokes Bot"],
+            "reply_overhead_chars": 0,
         }
         self.book = jokes.JokeBook(
             self._write_json({"cat": ["c1", "c2"], "dustin": ["d1", "d2"]}),
@@ -296,20 +357,33 @@ class HandlerTest(TempFileMixin, unittest.TestCase):
         asyncio.run(self._handler()(FakeEvent("joke cat")))
         self.assertEqual(self.sender.messages, ["c1"])
 
+    def test_over_the_air_format_produces_a_reply(self):
+        # The exact payload shape captured from a live request.
+        asyncio.run(self._handler()(FakeEvent("KF8DDU: joke cat")))
+        self.assertEqual(self.sender.messages, ["c1"])
+
     def test_unrelated_chatter_is_ignored(self):
-        asyncio.run(self._handler()(FakeEvent("good morning everyone")))
+        asyncio.run(self._handler()(FakeEvent("KF8DDU: good morning everyone")))
+        self.assertEqual(self.sender.messages, [])
+
+    def test_the_bot_ignores_its_own_traffic(self):
+        asyncio.run(self._handler()(FakeEvent("Marion Jokes Bot: joke cat")))
+        self.assertEqual(self.sender.messages, [])
+
+    def test_self_ignore_is_case_insensitive(self):
+        asyncio.run(self._handler()(FakeEvent("marion jokes bot: joke cat")))
         self.assertEqual(self.sender.messages, [])
 
     def test_repeat_requests_advance_the_rotation(self):
         handler = self._handler()
-        asyncio.run(handler(FakeEvent("joke cat")))
-        asyncio.run(handler(FakeEvent("joke cat")))
+        asyncio.run(handler(FakeEvent("KF8DDU: joke cat")))
+        asyncio.run(handler(FakeEvent("KF8DDU: joke cat")))
         self.assertEqual(self.sender.messages, ["c1", "c2"])
 
     def test_each_trigger_uses_its_own_list(self):
         handler = self._handler()
-        asyncio.run(handler(FakeEvent("joke dustin")))
-        asyncio.run(handler(FakeEvent("joke cat")))
+        asyncio.run(handler(FakeEvent("KF8DDU: joke dustin")))
+        asyncio.run(handler(FakeEvent("KF8DDU: joke cat")))
         self.assertEqual(self.sender.messages, ["d1", "c1"])
 
     def test_cooldown_suppresses_a_rapid_repeat(self):
@@ -323,6 +397,16 @@ class HandlerTest(TempFileMixin, unittest.TestCase):
         asyncio.run(handler(FakeEvent("joke cat")))
         asyncio.run(handler(FakeEvent("joke cat")))
         self.assertEqual(self.book.peek("cat"), "c2")
+
+    def test_reply_overhead_shrinks_the_usable_limit(self):
+        self.cfg["reply_overhead_chars"] = 18
+        self.book = jokes.JokeBook(
+            self._write_json({"cat": ["x" * 400]}), self._temp_path()
+        )
+        asyncio.run(self._handler()(FakeEvent("joke cat")))
+        self.assertEqual(
+            len(self.sender.messages[0]), jokes.MAX_MESSAGE_CHARS - 18
+        )
 
     def test_a_payloadless_event_is_survivable(self):
         asyncio.run(self._handler()(FakeEvent(None)))
