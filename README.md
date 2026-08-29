@@ -39,6 +39,41 @@ companion socket drops.
 
 ## Install
 
+### 1. Create the companion
+
+This bot needs its **own** companion on the repeater — it holds a connection
+open full time, so it cannot share one with a timer-driven bot. The others use
+5050–5054; this config assumes a sixth on 5055.
+
+Create it in the openHop web setup UI, then read the hash off the front of its
+public key: a key starting `dce34a9a...` means the companion is `0xdc`.
+
+**Every new companion needs a `companion_prefs` row before the mesh will hear
+it.** The whole network runs 2-byte path hashes; a companion without this row
+transmits happily, the send returns `command_ok`, and nothing reaches anyone:
+
+```bash
+sudo sqlite3 /var/lib/openhop_repeater/repeater.db \
+  "INSERT INTO companion_prefs (companion_hash, prefs_json)
+   VALUES ('0xdc', '{\"path_hash_mode\":1}');"
+sudo systemctl restart openhop-repeater
+```
+
+Verify all companions are present, and that nothing is left over from an
+identity you deleted and regenerated:
+
+```bash
+sudo sqlite3 /var/lib/openhop_repeater/repeater.db \
+  "SELECT companion_hash, prefs_json FROM companion_prefs;"
+```
+
+### 2. Install the code
+
+`meshcore` is **not** installed system-wide on this Pi. Every bot runs from its
+own virtualenv and its unit points at that venv's interpreter. Installing with
+`pip3 --break-system-packages` instead will produce `No module named 'meshcore'`
+the moment systemd starts the service as `pi`:
+
 ```bash
 sudo git clone https://github.com/pitbullcoder/jokes.git /opt/jokes
 cd /opt/jokes
@@ -57,7 +92,7 @@ sudo chown -R pi:pi /opt/jokes
 Skipping this does not stop the bot — it logs a warning and keeps answering —
 but the rotation position resets to the top of each list on every restart.
 
-Check the replies before putting it on the air:
+### 3. Check it before putting it on the air
 
 ```bash
 /opt/jokes/venv/bin/python3 /opt/jokes/jokes.py --list
@@ -68,7 +103,7 @@ Check the replies before putting it on the air:
 takes the next joke and does advance the rotation, printing the character count
 so you can see the headroom.
 
-Then install the service:
+### 4. Install the service
 
 ```bash
 sudo cp jokes.service /etc/systemd/system/
@@ -130,21 +165,37 @@ place:
 /opt/jokes/venv/bin/python3 /opt/jokes/probe.py
 ```
 
+### Symptom to cause
+
+| What you see | Where to look |
+| --- | --- |
+| `No module named 'meshcore'` | Unit is calling `/usr/bin/python3` instead of the venv |
+| `Permission denied: state.json.tmp` | `sudo chown -R pi:pi /opt/jokes` |
+| Connects, hears nothing at all | Run `probe.py`; if it prints nothing, the repeater is not delivering channel RX to this companion |
+| Hears the message, no reply | Trigger did not match — check `-v` output for the exact text, including the `SENDER: ` prefix |
+| `queueing` logged, no `sent` | Transmission is hanging; the send must not run on the event dispatcher |
+| `sent`, `command_ok`, nothing on air | Companion side. Check for its `companion_prefs` row first. |
+
+That last row is the one that bites hardest, because every layer reports
+success. The companion accepts the frame, the library returns
+`Event(type=EventType.OK)`, the log looks perfect, and the message goes
+nowhere. If a bot has never once been heard, check the row before debugging
+anything in Python.
+
+A quick way to isolate companion from code: point `config.json` at a companion
+you know works (the info bot's 5054 is idle except Fridays), restart, and send a
+request. If it comes through there, the code is fine and the companion is at
+fault. Put the port back afterwards.
+
 ## Notes
-
-- This bot needs its own companion on the repeater. The four existing bots use
-  5050–5054; the config here assumes a sixth on 5055. Create it in the web
-  setup UI, then give it 2-byte path hashes like the others:
-
-  ```bash
-  sudo sqlite3 /var/lib/openhop_repeater/repeater.db \
-    "INSERT INTO companion_prefs (companion_hash, prefs_json)
-     VALUES ('0xNN', '{\"path_hash_mode\":1}');"
-  ```
 
 - Because the bot both listens and replies on channel 0, watch the first live
   test closely. If you ever see it answering itself, stop the service and check
   what the reply text normalizes to.
+- The other bots on this Pi are timer-driven and transmit-only, so this is the
+  first one that depends on channel RX reaching a companion. If channel
+  receive ever stops working after an openHop upgrade, check whether the local
+  `main.py` fan-out patch survived — `manage.sh upgrade` overwrites it.
 
 ## License
 
