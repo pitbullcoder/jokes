@@ -458,5 +458,63 @@ class ShippedContentTest(unittest.TestCase):
                 )
 
 
+class AnnouncementTest(unittest.TestCase):
+    TEXT = "Net tonight at 8:30PM"
+
+    def _ann(self, **overrides):
+        entry = {"text": self.TEXT, "date": "2026-11-23", "every_mins": 30, "end": "21:30"}
+        entry.update(overrides)
+        return jokes.parse_announcements([entry], 112)[0]
+
+    @staticmethod
+    def _at(hour, minute, second=0, day=23):
+        return jokes.datetime.datetime(2026, 11, day, hour, minute, second)
+
+    def _run(self, announcements, sent, now):
+        sender = RecordingSender()
+        asyncio.run(jokes.announce_due(announcements, sent, sender, now))
+        return sender.messages
+
+    def test_fires_on_the_half_hour(self):
+        self.assertEqual(self._run([self._ann()], {}, self._at(16, 0, 10)), [self.TEXT])
+        self.assertEqual(self._run([self._ann()], {}, self._at(16, 30, 5)), [self.TEXT])
+
+    def test_a_slot_fires_only_once(self):
+        anns, sent = [self._ann()], {}
+        self.assertEqual(len(self._run(anns, sent, self._at(16, 0, 5))), 1)
+        self.assertEqual(self._run(anns, sent, self._at(16, 0, 25)), [])
+        self.assertEqual(len(self._run(anns, sent, self._at(16, 30, 5))), 1)
+
+    def test_a_late_start_does_not_send_a_stale_slot(self):
+        self.assertEqual(self._run([self._ann()], {}, self._at(15, 45)), [])
+
+    def test_nothing_on_other_days(self):
+        self.assertEqual(self._run([self._ann()], {}, self._at(16, 0, day=22)), [])
+        self.assertEqual(self._run([self._ann()], {}, self._at(16, 0, day=24)), [])
+
+    def test_end_is_exclusive(self):
+        self.assertEqual(len(self._run([self._ann()], {}, self._at(21, 0, 5))), 1)
+        self.assertEqual(self._run([self._ann()], {}, self._at(21, 30, 5)), [])
+
+    def test_start_is_honoured(self):
+        anns = [self._ann(start="18:00")]
+        self.assertEqual(self._run(anns, {}, self._at(17, 30, 5)), [])
+        self.assertEqual(len(self._run(anns, {}, self._at(18, 0, 5))), 1)
+
+    def test_overlong_text_is_rejected(self):
+        with self.assertRaises(ValueError):
+            jokes.parse_announcements(
+                [{"text": "x" * 113, "date": "2026-11-23", "every_mins": 30}], 112)
+
+    def test_bad_date_is_rejected(self):
+        with self.assertRaises(ValueError):
+            jokes.parse_announcements([{"text": "hi", "date": "11/23/2026", "every_mins": 30}], 112)
+
+    def test_shipped_config_loads(self):
+        cfg = jokes.load_config(jokes.DEFAULT_CONFIG_PATH)
+        for ann in cfg["announcements"]:
+            self.assertIsNone(jokes.match_trigger(ann["text"], cfg["triggers"]))
+
+
 if __name__ == "__main__":
     unittest.main()
