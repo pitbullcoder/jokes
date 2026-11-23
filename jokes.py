@@ -12,6 +12,7 @@ hears the same joke twice until the list wraps.
 
 import argparse
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -33,6 +34,12 @@ RECONNECT_DELAY_SECS = 15
 # Pending replies to hold before dropping. A backlog on a slow LoRa channel is
 # stale by the time it would go out, so a shallow queue is the honest choice.
 OUTBOX_DEPTH = 8
+
+# How often the announcer wakes to check whether a slot is due, and how late
+# it may still send one. The grace window stops a restart at 3:45 from firing
+# the 3:30 slot fifteen minutes late.
+ANNOUNCE_POLL_SECS = 20
+ANNOUNCE_GRACE_SECS = 90
 
 
 def load_config(path):
@@ -79,7 +86,108 @@ def load_config(path):
             "config 'reply_overhead_chars' must be an int in 0..%d" % (MAX_MESSAGE_CHARS - 1)
         )
 
+    cfg["announcements"] = parse_announcements(
+        cfg.get("announcements", []), MAX_MESSAGE_CHARS - overhead
+    )
+
     return cfg
+
+
+def _parse_clock(value, field):
+    try:
+        return datetime.datetime.strptime(value, "%H:%M").time()
+    except (TypeError, ValueError):
+        raise ValueError("announcement '%s' must be HH:MM, got %r" % (field, value))
+
+
+def parse_announcements(raw, limit):
+    """Validate the scheduled announcements block.
+
+    Each entry repeats ``text`` every ``every_mins`` minutes on ``date``
+    (YYYY-MM-DD, Pi local time), aligned to the clock -- every 30 means :00 and
+    :30 -- from ``start`` (inclusive) to ``end`` (exclusive), both HH:MM and
+    defaulting to the whole day. Text over the limit is rejected rather than
+    trimmed: an announcement cut off mid-sentence is worse than none.
+    """
+    if not isinstance(raw, list):
+        raise ValueError("config 'announcements' must be a list")
+
+    parsed = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ValueError("every announcement must be an object")
+
+        text = " ".join(str(entry.get("text", "")).split())
+        if not text:
+            raise ValueError("every announcement needs non-empty 'text'")
+        if len(text) > limit:
+            raise ValueError(
+                "announcement is %d chars, over the %d available: %s" % (len(text), limit, text)
+            )
+
+        try:
+            date = datetime.date.fromisoformat(entry.get("date", ""))
+        except (TypeError, ValueError):
+            raise ValueError("announcement 'date' must be YYYY-MM-DD, got %r" % entry.get("date"))
+
+        every = entry.get("every_mins")
+        if not isinstance(every, int) or every <= 0:
+            raise ValueError("announcement 'every_mins' must be a positive int")
+
+        start = _parse_clock(entry.get("start", "00:00"), "start")
+        end_raw = entry.get("end")
+        end = _parse_clock(end_raw, "end") if end_raw is not None else None
+        if end is not None and end <= start:
+            raise ValueError("announcement 'end' must be after 'start'")
+
+        parsed.append({"text": text, "date": date, "every_mins": every,
+                       "start": start, "end": end})
+
+    return parsed
+
+
+def due_slot(announcement, now):
+    """The slot an announcement should fire for at ``now``, or None.
+
+    Slots sit on clock multiples of ``every_mins`` from midnight. A slot counts
+    as due only within ANNOUNCE_GRACE_SECS of its time, so the bot never sends
+    a stale slot after a restart or a dropped connection.
+    """
+    if now.date() != announcement["date"]:
+        return None
+    if now.time() < announcement["start"]:
+        return None
+    if announcement["end"] is not None and now.time() >= announcement["end"]:
+        return None
+
+    midnight = datetime.datetime.combine(now.date(), datetime.time())
+    minutes = int((now - midnight).total_seconds() // 60)
+    slot = midnight + datetime.timedelta(
+        minutes=minutes - minutes % announcement["every_mins"]
+    )
+    if slot.time() < announcement["start"]:
+        return None
+    if (now - slot).total_seconds() > ANNOUNCE_GRACE_SECS:
+        return None
+    return slot
+
+
+async def announce_due(announcements, sent, sender, now):
+    """Queue every announcement whose slot is due and not yet sent."""
+    for index, announcement in enumerate(announcements):
+        slot = due_slot(announcement, now)
+        if slot is None or sent.get(index) == slot:
+            continue
+        sent[index] = slot
+        LOG.info("queueing announcement for %s: %s", slot.strftime("%H:%M"), announcement["text"])
+        await sender(announcement["text"])
+
+
+async def announcer(announcements, sent, sender, clock=datetime.datetime.now):
+    """Poll for due announcements until cancelled."""
+    while True:
+        await announce_due(announcements, sent, sender, clock())
+        await asyncio.sleep(ANNOUNCE_POLL_SECS)
 
 
 def load_jokes(path):
@@ -334,6 +442,9 @@ async def run(cfg, book, cooldown):
     """
     from meshcore import EventType, MeshCore
 
+    # Lives outside the reconnect loop so a dropped socket cannot repeat a slot.
+    announced = {}
+
     while True:
         try:
             mc = await MeshCore.create_tcp(cfg["host"], cfg["port"])
@@ -368,6 +479,11 @@ async def run(cfg, book, cooldown):
                 await asyncio.sleep(cfg["send_gap_secs"])
 
         worker = asyncio.create_task(transmit())
+        tasks = [worker]
+        if cfg["announcements"]:
+            tasks.append(asyncio.create_task(
+                announcer(cfg["announcements"], announced, enqueue)
+            ))
 
         try:
             mc.subscribe(
@@ -382,12 +498,14 @@ async def run(cfg, book, cooldown):
                 await asyncio.sleep(3600)
                 book.reload_if_changed()
         except asyncio.CancelledError:
-            worker.cancel()
+            for task in tasks:
+                task.cancel()
             await mc.disconnect()
             raise
         except Exception as exc:  # noqa: BLE001 - drop the socket and retry
             LOG.error("connection lost: %s", exc)
-            worker.cancel()
+            for task in tasks:
+                task.cancel()
             try:
                 await mc.disconnect()
             except Exception:  # noqa: BLE001
@@ -443,6 +561,11 @@ def main(argv=None):
         for phrase, list_name in sorted(cfg["triggers"].items()):
             joke = book.peek(list_name, limit=limit)
             print("%-16s -> %-10s %s" % (phrase, list_name, joke or "(empty list)"))
+        for ann in cfg["announcements"]:
+            window = "%s-%s" % (ann["start"].strftime("%H:%M"),
+                                ann["end"].strftime("%H:%M") if ann["end"] else "24:00")
+            print("announce %s %s every %dm (%d chars): %s" % (
+                ann["date"], window, ann["every_mins"], len(ann["text"]), ann["text"]))
         return 0
 
     if args.dry_run:

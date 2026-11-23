@@ -128,6 +128,7 @@ dustin`. Then send `joke cat` from a client on the public channel.
 | `triggers` | Map of trigger phrase to joke list name |
 | `jokes_path` | Optional. Defaults to `jokes.json` beside the script. |
 | `state_path` | Optional. Defaults to `state.json` beside the script. |
+| `announcements` | Optional. Scheduled posts: `text`, `date` (YYYY-MM-DD, Pi local time), `every_mins` (clock-aligned), optional `start`/`end` (HH:MM, end exclusive). Text over the reply limit is rejected at startup. A slot missed by more than 90s is skipped, not sent late. |
 
 Adding a joke is a `jokes.json` edit — the bot notices the file changed and
 reloads it on the next request, no restart needed.
